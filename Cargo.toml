@@ -1,0 +1,14 @@
+[package]
+name = "cache-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+prost = "0.13.5"
+prost-types = "0.13.5"
+bytes = "1"
+thiserror = "1"
+
+[build-dependencies]
+prost-build = "0.13.5"
