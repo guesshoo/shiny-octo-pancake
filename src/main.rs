@@ -91,7 +91,6 @@ fn process_request(req: proto::Envelope) -> Result<proto::EnvelopeResponse, Box<
             println!("STATS for {}", st.cache_name);
             resp.body = Some(proto::envelope_response::Body::StatsResponse(proto::StatsResponse { hits: 0, misses: 0, entry_count: 0 }));
         }
-        _ => {}
     }
     Ok(resp)
 }

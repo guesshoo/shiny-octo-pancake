@@ -10,10 +10,16 @@ prost-types = "0.13.5"
 bytes = "1"
 thiserror = "1"
 hex = "0.4.3"
+config = "0.15.11"
+lmdb = "0.8.0"
 
 [build-dependencies]
 prost-build = "0.13.5"
 
+
+[dev-dependencies]
+# only used when running tests
+tempfile = "3"
 
 [[bin]]
 name = "server"
