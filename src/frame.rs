@@ -2,11 +2,18 @@ use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::{ BytesMut, Buf, BufMut};
 
-const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 1;
+
+pub type MessageType = u8;
+
+pub const MESSAGE_TYPE_UNSPECIFIED:        MessageType = 0;
+pub const MESSAGE_TYPE_ENVELOPE:           MessageType = 1;
+pub const MESSAGE_TYPE_ENVELOPE_RESPONSE:  MessageType = 2;
+pub const MESSAGE_TYPE_DISCONNECT:         MessageType = 3;
 
 /// Read and parse the 8-byte frame header from any AsyncRead source.
 #[allow(dead_code)]
-async fn read_frame_header<R>(reader: &mut R) -> Result<(u32, u8, u8, u16), Box<dyn Error>>
+pub async fn read_frame_header<R>(reader: &mut R) -> Result<(u32, u8, u8, u16), Box<dyn Error>>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -21,7 +28,7 @@ where
 }
 
 /// Write a framed message: header + payload.
-async fn write_frame<W>(writer: &mut W, msg_type: u8, payload: &[u8]) -> Result<(), Box<dyn Error>>
+pub async fn write_frame<W>(writer: &mut W, msg_type: u8, payload: &[u8]) -> Result<(), Box<dyn Error>>
 where
     W: AsyncWriteExt + Unpin,
 {

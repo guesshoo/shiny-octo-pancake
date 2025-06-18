@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package uc.msg;
 
+
 // Top-level envelope for any request
 message Envelope {
   uint32 request_id = 1;       // client-generated, for matching replies
