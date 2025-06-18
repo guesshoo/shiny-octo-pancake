@@ -1,14 +1,22 @@
-
 {
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Launch Server (binary)", // If you prefer to build on the command line 
             "type": "lldb",
             "request": "launch",
-            "name": "Debug",
-            "program": "${workspaceFolder}/target/debug/cache-rs",
-            "args": [],
+            "program": "${workspaceFolder}/target/debug/server",
+            "args": [], // CLI args for server
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "rust: cargo build"
+        },
+        {
+            "name": "Launch Client (binary)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/client",
+            "args": [], // CLI args for client
             "cwd": "${workspaceFolder}"
-        }
+        },
     ]
 }
