@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package ucmsg;
+package uc.msg;
 
 // Top-level envelope for any request
 message Envelope {
