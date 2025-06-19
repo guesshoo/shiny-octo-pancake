@@ -279,6 +279,13 @@ mod tests {
         test_storage(&lmdb)
     }
 
+    #[ignore]
+    #[test]
+    fn test_lmdb_data_dir() ->  Result<(), StorageError>{
+        let lmdb = LmdbStorage::new(Path::new("data/lmdb"), 1).expect("create lmdb");
+        test_storage(&lmdb)
+    }
+
     #[test]
     fn wal_on_in_memory_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
