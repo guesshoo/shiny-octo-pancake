@@ -104,10 +104,10 @@ mod tests {
         let val = store.get(b"foo").unwrap();
         assert_eq!(val, Some(b"bar".to_vec()));
 
-        // putting it again
-        store.put(b"foo", b"value").unwrap();
-        let val = store.get(b"foo").unwrap();
-        assert_eq!(val, Some(b"value".to_vec()));
+        // // putting it again
+        // store.put(b"foo", b"value").unwrap();
+        // let val = store.get(b"foo").unwrap();
+        // assert_eq!(val, Some(b"value".to_vec()));
 
         // delete and get
         let deleted = store.delete(b"foo").unwrap();

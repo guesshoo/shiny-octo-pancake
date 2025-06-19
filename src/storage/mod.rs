@@ -1,11 +1,11 @@
-//! Simple KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
+// Simple KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
 
-use lmdb::{Environment, Database, Transaction, WriteFlags, RoTransaction};
+use lmdb::{Environment, Database, Transaction, WriteFlags};
 use sled::Db as SledDb;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{ RwLock, Arc};
 use std::fs::{OpenOptions, File};
 use std::io::{self, Read, Seek, SeekFrom, Write, IoSlice};
 use std::collections::HashMap;
@@ -37,19 +37,24 @@ pub trait Storage {
 //=== LMDB Backend ===
 
 /// LMDB-backed implementation of `Storage`.
+#[derive(Clone)]
 pub struct LmdbStorage {
-    env: Environment,
+    env: Arc<Environment>,
     db: Database,
 }
+
+use std::fs;
 
 impl LmdbStorage {
     /// Open or create an LMDB environment at the given path.
     pub fn new(path: impl AsRef<Path>, max_dbs: u32) -> Result<Self, StorageError> {
+        fs::create_dir_all(&path).unwrap();
         let env = Environment::new()
             .set_max_dbs(max_dbs)
+            .set_map_size(1 << 30) // 1 GiB
             .open(path.as_ref())?;
         let db = env.create_db(Some("kv_store"), lmdb::DatabaseFlags::empty())?;
-        Ok(LmdbStorage { env, db })
+        Ok(LmdbStorage { env: Arc::new(env), db })
     }
 }
 
@@ -72,7 +77,11 @@ impl Storage for LmdbStorage {
 
     fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
         let mut wtxn = self.env.begin_rw_txn()?;
-        let _ = wtxn.del(self.db, &key, None);
+        match wtxn.del(self.db, &key, None){
+            Ok(_) => (),
+            Err(lmdb::Error::NotFound) => (),
+            Err(e) => return Err( StorageError::Lmdb(e)),
+        }
         wtxn.commit()?;
         Ok(())
     }
@@ -145,7 +154,7 @@ impl Storage for SledStorage {
 //=== WAL Operation ===
 
 #[derive(Serialize, Deserialize, Debug)]
-enum Operation {
+pub enum Operation {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
 }
@@ -236,10 +245,16 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_storage<S: Storage>(store: &S) -> Result<(), StorageError> {
-        store.put(b"k1", b"v1")?;
-        assert_eq!(store.get(b"k1")?.unwrap(), b"v1".to_vec());
-        store.delete(b"k1")?;
-        assert!(store.get(b"k1")?.is_none());
+        // get on missing key
+        assert_eq!(store.get(b"foo").unwrap(), None);
+
+        // put and get
+        store.put(b"foo", b"bar")?;
+        assert_eq!(store.get(b"foo")?.unwrap(), b"bar".to_vec());
+
+        // delete and get
+        store.delete(b"foo").unwrap();
+        assert_eq!(store.get(b"foo").unwrap(), None);
         Ok(())
     }
 
@@ -259,7 +274,8 @@ mod tests {
     #[test]
     fn lmdb_storage_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
-        let lmdb = LmdbStorage::new(dir.path().join("lmdb"), 1)?;
+        let lmdb = LmdbStorage::new(dir.path().join("lmdb"), 1)
+            .expect("open lmdb store");
         test_storage(&lmdb)
     }
 
@@ -278,4 +294,43 @@ mod tests {
         let wal = WalStorage::new(sled, dir.path().join("wal_sled.log"))?;
         test_storage(&wal)
     }
+
+    #[test]
+    fn wal_on_in_memory_replay_works() -> Result<(), StorageError> {
+        let dir = tempdir()?;
+        let wal_path = dir.path().join("wal_mem_replay.log");
+        // Phase 1: initial writes
+        {
+            let mem1 = InMemoryStorage::new();
+            let store1 = WalStorage::new(mem1, &wal_path)?;
+            store1.put(b"a", b"1")?;
+            store1.put(b"b", b"2")?;
+        }
+        // Phase 2: replay into a fresh in-memory
+        let mem2 = InMemoryStorage::new();
+        let store2 = WalStorage::new(mem2, &wal_path)?;
+        assert_eq!(store2.get(b"a")?.unwrap(), b"1".to_vec());
+        assert_eq!(store2.get(b"b")?.unwrap(), b"2".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn wal_on_sled_replay_works() -> Result<(), StorageError> {
+        let dir = tempdir()?;
+        let wal_path = dir.path().join("wal_sled_replay.log");
+        // Phase 1: initial writes
+        {
+            let sled1 = SledStorage::new(dir.path().join("sled3"))?;
+            let store1 = WalStorage::new(sled1, &wal_path)?;
+            store1.put(b"x", b"7")?;
+            store1.put(b"y", b"8")?;
+        }
+        // Phase 2: replay into a fresh sled
+        let sled2 = SledStorage::new(dir.path().join("sled4"))?;
+        let store2 = WalStorage::new(sled2, &wal_path)?;
+        assert_eq!(store2.get(b"x")?.unwrap(), b"7".to_vec());
+        assert_eq!(store2.get(b"y")?.unwrap(), b"8".to_vec());
+        Ok(())
+    }
+
 }

@@ -1,6 +1,6 @@
 pub mod frame;
 pub mod storage;
-
+pub mod kv;
 pub mod snazzy {
     pub mod items {
         include!(concat!(env!("OUT_DIR"), "/snazzy.items.rs"));
