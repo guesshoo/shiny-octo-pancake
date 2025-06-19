@@ -1,0 +1,29 @@
+namespace cache;
+
+// The in-LMDB cache entry
+table Entry {
+  value:[ubyte];    // raw bytes payload
+  expires_at:ulong; // 0 means no TTL
+}
+
+// WAL “Put” record
+table WalPut {
+  key:[ubyte];
+  entry:Entry;
+}
+
+// WAL “Delete” record
+table WalDelete {
+  key:[ubyte];
+}
+
+// Union of WAL operations
+union WalPayload { WalPut, WalDelete }
+
+// Top-level WAL record
+table WalRecord {
+  timestamp:ulong;        // new field, UNIX seconds or milliseconds
+  payload:WalPayload;
+}
+
+root_type WalRecord;

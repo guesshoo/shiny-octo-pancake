@@ -1,17 +1,19 @@
 [package]
 name = "cache-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2018"
 
 [dependencies]
-tokio = { version = "1.45", features = ["full"] }
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+bytes = "1"
+config = "0.15.11"
+hex = "0.4.3"
+lmdb = "0.8.0"
 prost = "0.13.5"
 prost-types = "0.13.5"
-bytes = "1"
 thiserror = "1"
-hex = "0.4.3"
-config = "0.15.11"
-lmdb = "0.8.0"
+tokio = { version = "1.45", features = ["full"] }
 
 [build-dependencies]
 prost-build = "0.13.5"
