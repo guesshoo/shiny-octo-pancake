@@ -119,6 +119,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "serde",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
