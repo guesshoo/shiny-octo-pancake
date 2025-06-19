@@ -9,6 +9,7 @@ use std::sync::RwLock;
 use std::fs::{OpenOptions, File};
 use std::io::{self, Read, Seek, SeekFrom, Write, IoSlice};
 use std::collections::HashMap;
+use std::cell::RefCell;
 
 /// Errors that can occur in storage operations.
 #[derive(Error, Debug)]
@@ -55,7 +56,7 @@ impl LmdbStorage {
 impl Storage for LmdbStorage {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.db, key) {
+        match txn.get(self.db, &key) {
             Ok(slice) => Ok(Some(slice.to_vec())),
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(StorageError::Lmdb(e)),
@@ -64,14 +65,14 @@ impl Storage for LmdbStorage {
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let mut wtxn = self.env.begin_rw_txn()?;
-        wtxn.put(self.db, key, value, WriteFlags::empty())?;
+        wtxn.put(self.db, &key, &value, WriteFlags::empty())?;
         wtxn.commit()?;
         Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
         let mut wtxn = self.env.begin_rw_txn()?;
-        let _ = wtxn.del(self.db, key, None);
+        let _ = wtxn.del(self.db, &key, None);
         wtxn.commit()?;
         Ok(())
     }
@@ -193,19 +194,19 @@ impl WriteAheadLog {
 /// WAL + inner storage wrapper.
 pub struct WalStorage<S: Storage> {
     inner: S,
-    wal: WriteAheadLog,
+    wal: RefCell<WriteAheadLog>,
 }
 
 impl<S: Storage> WalStorage<S> {
     pub fn new(inner: S, wal_path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let mut wal = WriteAheadLog::open(wal_path)?;
-        for op in wal.replay()? {
+        let mut log = WriteAheadLog::open(wal_path)?;
+        for op in log.replay()? {
             match op {
-                Operation::Put { key, value } => { inner.put(&key, &value)?; }
-                Operation::Delete { key } => { inner.delete(&key)?; }
+                Operation::Put { key, value } => inner.put(&key, &value)?,
+                Operation::Delete { key } => inner.delete(&key)?,
             }
         }
-        Ok(WalStorage { inner, wal })
+        Ok(WalStorage { inner, wal: RefCell::new(log) })
     }
 }
 
@@ -216,13 +217,13 @@ impl<S: Storage> Storage for WalStorage<S> {
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let op = Operation::Put { key: key.to_vec(), value: value.to_vec() };
-        self.wal.append_op(&op)?;
+        self.wal.borrow_mut().append_op(&op)?;
         self.inner.put(key, value)
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
         let op = Operation::Delete { key: key.to_vec() };
-        self.wal.append_op(&op)?;
+        self.wal.borrow_mut().append_op(&op)?;
         self.inner.delete(key)
     }
 }
