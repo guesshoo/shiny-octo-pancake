@@ -3,13 +3,15 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 
-
+// Errors returned by KvStore operations.
 #[derive(Debug, Error)]
 pub enum KvsError {
+    ///An underlying LMDB error occured.
     #[error("LMDB error: {0}")]
     Lmdb(#[from] lmdb::Error),
 }
 
+// LMDB-backed key-value store
 #[derive(Clone)]
 pub struct KvStore {
     env: Arc<Environment>,
@@ -17,6 +19,12 @@ pub struct KvStore {
 }
 
 impl KvStore {
+    /// Opens (or creates) an LMDB environment at the specified path.
+    ///
+    /// `path` is the directory where the LMDB data files will reside.
+    /// We set the map size to 1 GiB (`1 << 30` bytes) to cap
+    /// the maximum database size.
+    /// Creates a LDMB database called `kv`
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, KvsError> {
         let env = Environment::new()
             .set_max_dbs(1)
@@ -26,6 +34,12 @@ impl KvStore {
         Ok(KvStore { env: Arc::new(env), db })
     }
 
+    /// Inserts or updates a value under the given `key`.
+    ///
+    /// Both `key` and `value` are borrowed as `&[u8]` to avoid forcing
+    /// the caller to allocate a `Vec<u8>` when they already have
+    /// a contiguous byte buffer. Internally, LMDB will copy the data
+    /// into its own memory-mapped region.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvsError> {
         let mut wtxn = self.env.begin_rw_txn()?;
         wtxn.put(self.db, &key, &value, WriteFlags::empty())?;
@@ -33,13 +47,31 @@ impl KvStore {
         Ok(())
     }
 
-    pub fn delete(&self, key: &[u8]) -> Result<(), KvsError> {
+    /// Deletes the entry for the specified `key`, if it exists.
+    ///
+    /// Returns the number of entries removed (0 or 1). We return a
+    /// count rather than a unit type so callers can distinguish
+    /// between "key not found" (0) and successful deletion (1).
+    pub fn delete(&self, key: &[u8]) -> Result<usize, KvsError> {
         let mut wtxn = self.env.begin_rw_txn()?;
-        wtxn.del(self.db, &key, None)?;
-        wtxn.commit()?;
-        Ok(())
+        match wtxn.del(self.db, &key, None){
+            Ok(_) => {
+                wtxn.commit()?;
+                Ok(1)
+            }
+            Err(lmdb::Error::NotFound) => {
+                wtxn.abort();
+                Ok(0)
+            }
+            Err(e) => Err(KvsError::Lmdb(e)),
+        }
     }
 
+    /// Retrieves the value for `key`, if present.
+    ///
+    /// Uses a lightweight read-only transaction (`begin_ro_txn`) under the hood.
+    /// Returns `Ok(Some(value))` on success, `Ok(None)` if the key is missing,
+    /// or an error if any other LMDB issue occurs.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvsError> {
         let rtxn = self.env.begin_ro_txn()?;
         match rtxn.get(self.db, &key) {
@@ -78,7 +110,8 @@ mod tests {
         assert_eq!(val, Some(b"value".to_vec()));
 
         // delete and get
-        store.delete(b"foo").unwrap();
+        let deleted = store.delete(b"foo").unwrap();
+        assert_eq!(deleted, 1); // deleted 1 entry
         assert_eq!(store.get(b"foo").unwrap(), None);
     }
 
@@ -90,9 +123,8 @@ mod tests {
         fs::create_dir_all(&db_path).unwrap();
 
         let store = KvStore::open(&db_path).expect("open store");
-        // deleting a non-existent key should return an error
-        assert!(store.delete(b"no_key").is_err());
-        // after the failed delete, the key should still be absent
+        let deleted = store.delete(b"no_key").unwrap();
+        assert_eq!(deleted, 0);
         assert_eq!(store.get(b"no_key").unwrap(), None);
     }
 
