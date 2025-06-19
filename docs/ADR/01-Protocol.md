@@ -45,16 +45,14 @@ Start with **Protocol Buffers**
   * Easy to define & generate code for Rust, Java, Python, Go.
   * Built-in versioning rules (adding/removing fields safely).
   * Well-undestood performance characteristics (you will pay a small parse cost).
-* When to consider **FlatBuffers**:
+* To consider **FlatBuffers**:
+  * when we have scaffold and structured the project.
   * If zero-copy reads are critical (i.e. Need to handle millions of ops/sec and can’t afford any heap allocations).
   * If payloads are large, and require random-access into nested structures without unpacking.
 
 ### Summary
-Summary
-Framing: 4-byte length + 1-byte version + 1-byte type + 2-byte flags.
 
-Wire format: Protobuf for day-1 (easy cross-language, schema evolution).
-
-.proto: Define a small Envelope/EnvelopeResponse with all your request/response types.
-
-Parsing: Use generated code, keep your Rust server zero-copy for the header, then prost::Message::decode for the rest.
+* Framing: 4-byte length + 1-byte version + 1-byte type + 2-byte flags.
+* Wire format: Protobuf for day-1 (easy cross-language, schema evolution).
+* .proto: Define a small Envelope/EnvelopeResponse with all your request/response types.
+* Parsing: Use generated code, keep your Rust server zero-copy for the header, then prost::Message::decode for the rest.
