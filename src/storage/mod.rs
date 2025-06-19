@@ -1,16 +1,14 @@
-//! Zero-copy KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
+//! Simple KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
 
-pub use self::backend::*;
-pub use self::lmdb::LmdbStorage;
-pub use self::sled::SledStorage;
-pub use self::memory::InMemoryStorage;
-pub use self::wal::WalStorage;
-
-mod lmdb;
-mod sled;
-mod memory;
-mod wal;
-
+use lmdb::{Environment, Database, Transaction, WriteFlags, RoTransaction};
+use sled::Db as SledDb;
+use serde::{Serialize, Deserialize};
+use thiserror::Error;
+use std::path::Path;
+use std::sync::RwLock;
+use std::fs::{OpenOptions, File};
+use std::io::{self, Read, Seek, SeekFrom, Write, IoSlice};
+use std::collections::HashMap;
 
 /// Errors that can occur in storage operations.
 #[derive(Error, Debug)]
@@ -25,27 +23,209 @@ pub enum StorageError {
     Serde(#[from] bincode::Error),
 }
 
-/// Generic storage trait, not tied to any backend's transaction type.
+/// Generic storage trait, simple owned buffer API.
 pub trait Storage {
-    /// Associated read-transaction handle type.
-    type RoTxn<'txn>: 'txn;
-    /// Associated zero-copy value slice type.
-    type Value<'txn>: AsRef<[u8]> + 'txn;
-
-    /// Begin a read-only transaction/context.
-    fn begin_read(&self) -> Result<Self::RoTxn<'_>, StorageError>;
-    /// Get a value by key within a read transaction.
-    fn get<'txn>(
-        &self,
-        txn: &'txn Self::RoTxn<'txn>,
-        key: &[u8],
-    ) -> Result<Option<Self::Value<'txn>>, StorageError>;
+    /// Get a value by key. Returns Ok(None) if key not found.
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError>;
     /// Put a key-value pair into storage.
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError>;
     /// Delete a key (no-op if missing).
     fn delete(&self, key: &[u8]) -> Result<(), StorageError>;
 }
 
+//=== LMDB Backend ===
+
+/// LMDB-backed implementation of `Storage`.
+pub struct LmdbStorage {
+    env: Environment,
+    db: Database,
+}
+
+impl LmdbStorage {
+    /// Open or create an LMDB environment at the given path.
+    pub fn new(path: impl AsRef<Path>, max_dbs: u32) -> Result<Self, StorageError> {
+        let env = Environment::new()
+            .set_max_dbs(max_dbs)
+            .open(path.as_ref())?;
+        let db = env.create_db(Some("kv_store"), lmdb::DatabaseFlags::empty())?;
+        Ok(LmdbStorage { env, db })
+    }
+}
+
+impl Storage for LmdbStorage {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.db, key) {
+            Ok(slice) => Ok(Some(slice.to_vec())),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(StorageError::Lmdb(e)),
+        }
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let mut wtxn = self.env.begin_rw_txn()?;
+        wtxn.put(self.db, key, value, WriteFlags::empty())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+        let mut wtxn = self.env.begin_rw_txn()?;
+        let _ = wtxn.del(self.db, key, None);
+        wtxn.commit()?;
+        Ok(())
+    }
+}
+
+//=== In-Memory Backend ===
+
+/// In-memory HashMap implementation. Not durable.
+pub struct InMemoryStorage {
+    map: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl InMemoryStorage {
+    pub fn new() -> Self {
+        InMemoryStorage { map: RwLock::new(HashMap::new()) }
+    }
+}
+
+impl Storage for InMemoryStorage {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let guard = self.map.read().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let mut guard = self.map.write().unwrap();
+        guard.insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+        let mut guard = self.map.write().unwrap();
+        guard.remove(key);
+        Ok(())
+    }
+}
+
+//=== Sled Backend ===
+
+/// Sled database implementation.
+pub struct SledStorage {
+    db: SledDb,
+}
+
+impl SledStorage {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let db = sled::open(path)?;
+        Ok(SledStorage { db })
+    }
+}
+
+impl Storage for SledStorage {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.db.get(key)?.map(|ivec| ivec.to_vec()))
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        self.db.insert(key, value)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+        self.db.remove(key)?;
+        self.db.flush()?;
+        Ok(())
+    }
+}
+
+//=== WAL Operation ===
+
+#[derive(Serialize, Deserialize, Debug)]
+enum Operation {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+/// Append-only write-ahead log using vectored I/O.
+pub struct WriteAheadLog {
+    file: File,
+}
+
+impl WriteAheadLog {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path.as_ref())?;
+        Ok(WriteAheadLog { file })
+    }
+
+    pub fn append_op(&mut self, op: &Operation) -> Result<(), StorageError> {
+        let payload = bincode::serialize(op)?;
+        let len = (payload.len() as u32).to_le_bytes();
+        let bufs = [IoSlice::new(&len), IoSlice::new(&payload)];
+        self.file.write_vectored(&bufs)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    pub fn replay(&mut self) -> Result<Vec<Operation>, StorageError> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut ops = Vec::new();
+        loop {
+            let mut lenbuf = [0; 4];
+            if self.file.read_exact(&mut lenbuf).is_err() { break; }
+            let len = u32::from_le_bytes(lenbuf) as usize;
+            let mut buf = vec![0; len];
+            self.file.read_exact(&mut buf)?;
+            ops.push(bincode::deserialize(&buf)?);
+        }
+        Ok(ops)
+    }
+}
+
+//=== WAL Wrapper ===
+
+/// WAL + inner storage wrapper.
+pub struct WalStorage<S: Storage> {
+    inner: S,
+    wal: WriteAheadLog,
+}
+
+impl<S: Storage> WalStorage<S> {
+    pub fn new(inner: S, wal_path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let mut wal = WriteAheadLog::open(wal_path)?;
+        for op in wal.replay()? {
+            match op {
+                Operation::Put { key, value } => { inner.put(&key, &value)?; }
+                Operation::Delete { key } => { inner.delete(&key)?; }
+            }
+        }
+        Ok(WalStorage { inner, wal })
+    }
+}
+
+impl<S: Storage> Storage for WalStorage<S> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let op = Operation::Put { key: key.to_vec(), value: value.to_vec() };
+        self.wal.append_op(&op)?;
+        self.inner.put(key, value)
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
+        let op = Operation::Delete { key: key.to_vec() };
+        self.wal.append_op(&op)?;
+        self.inner.delete(key)
+    }
+}
 
 //=== Tests ===
 
@@ -56,11 +236,9 @@ mod tests {
 
     fn test_storage<S: Storage>(store: &S) -> Result<(), StorageError> {
         store.put(b"k1", b"v1")?;
-        let txn = store.begin_read()?;
-        assert_eq!(store.get(&txn, b"k1")?.unwrap().as_ref(), b"v1");
+        assert_eq!(store.get(b"k1")?.unwrap(), b"v1".to_vec());
         store.delete(b"k1")?;
-        let txn2 = store.begin_read()?;
-        assert!(store.get(&txn2, b"k1")?.is_none());
+        assert!(store.get(b"k1")?.is_none());
         Ok(())
     }
 
@@ -88,7 +266,7 @@ mod tests {
     fn wal_on_in_memory_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
         let mem = InMemoryStorage::new();
-        let mut wal = WalStorage::new(mem, dir.path().join("wal_mem.log"))?;
+        let wal = WalStorage::new(mem, dir.path().join("wal_mem.log"))?;
         test_storage(&wal)
     }
 
@@ -96,7 +274,7 @@ mod tests {
     fn wal_on_sled_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
         let sled = SledStorage::new(dir.path().join("sled2"))?;
-        let mut wal = WalStorage::new(sled, dir.path().join("wal_sled.log"))?;
+        let wal = WalStorage::new(sled, dir.path().join("wal_sled.log"))?;
         test_storage(&wal)
     }
 }
