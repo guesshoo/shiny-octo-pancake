@@ -56,6 +56,12 @@ impl LmdbStorage {
         let db = env.create_db(Some("kv_store"), lmdb::DatabaseFlags::empty())?;
         Ok(LmdbStorage { env: Arc::new(env), db })
     }
+
+    // Create a storage from existing shared environment and named database
+    pub fn from_env( env: Arc<Environment>, name: &str) -> Result<Self, StorageError> {
+        let db = env.create_db(Some(name), lmdb::DatabaseFlags::empty())?;
+        Ok(LmdbStorage {  env, db })
+    }
 }
 
 impl Storage for LmdbStorage {
