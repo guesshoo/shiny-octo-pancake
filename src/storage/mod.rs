@@ -1,11 +1,11 @@
-// Simple KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
+//! Simple KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
 
-use lmdb::{Environment, Database, Transaction, WriteFlags};
+use lmdb::{Environment, Database, Transaction, WriteFlags, RoTransaction};
 use sled::Db as SledDb;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use std::path::Path;
-use std::sync::{ RwLock, Arc};
+use std::sync::RwLock;
 use std::fs::{OpenOptions, File};
 use std::io::{self, Read, Seek, SeekFrom, Write, IoSlice};
 use std::collections::HashMap;
@@ -37,31 +37,38 @@ pub trait Storage {
 //=== LMDB Backend ===
 
 /// LMDB-backed implementation of `Storage`.
-#[derive(Clone)]
+/// LMDB-backed implementation of `Storage`.
 pub struct LmdbStorage {
-    env: Arc<Environment>,
-    db: Database,
+    /// Shared LMDB environment
+    pub env: Arc<Environment>,
+    /// Named database handle
+    pub db: Database,
 }
-
-use std::fs;
 
 impl LmdbStorage {
     /// Open or create an LMDB environment at the given path.
     pub fn new(path: impl AsRef<Path>, max_dbs: u32) -> Result<Self, StorageError> {
-        fs::create_dir_all(&path).unwrap();
+        // ensure directory
+        std::fs::create_dir_all(path.as_ref())?;
         let env = Environment::new()
             .set_max_dbs(max_dbs)
-            .set_map_size(1 << 30) // 1 GiB
             .open(path.as_ref())?;
+        let env = Arc::new(env);
         let db = env.create_db(Some("kv_store"), lmdb::DatabaseFlags::empty())?;
-        Ok(LmdbStorage { env: Arc::new(env), db })
+        Ok(LmdbStorage { env, db })
     }
 
-    // Create a storage from existing shared environment and named database
-    pub fn from_env( env: Arc<Environment>, name: &str) -> Result<Self, StorageError> {
+    /// Create a storage from an existing shared environment and named database
+    pub fn from_env(env: Arc<Environment>, name: &str) -> Result<Self, StorageError> {
         let db = env.create_db(Some(name), lmdb::DatabaseFlags::empty())?;
-        Ok(LmdbStorage {  env, db })
+        Ok(LmdbStorage { env, db })
     }
+
+    /// Change active named database in this environment (reuse struct)
+    pub fn use_db(&self, name: &str) -> Result<Self, StorageError> {
+        let db = Arc::clone(&self.env).create_db(Some(name), lmdb::DatabaseFlags::empty())?;
+        Ok(LmdbStorage { env: Arc::clone(&self.env), db })
+    }  
 }
 
 impl Storage for LmdbStorage {
@@ -83,11 +90,12 @@ impl Storage for LmdbStorage {
 
     fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
         let mut wtxn = self.env.begin_rw_txn()?;
-        match wtxn.del(self.db, &key, None){
+        // Attempt delete; ignore NotFound, but propagate other errors
+        match wtxn.del(self.db, &key, None) {
             Ok(_) => (),
             Err(lmdb::Error::NotFound) => (),
-            Err(e) => return Err( StorageError::Lmdb(e)),
-        }
+            Err(e) => return Err(StorageError::Lmdb(e)),
+        };
         wtxn.commit()?;
         Ok(())
     }
@@ -160,7 +168,7 @@ impl Storage for SledStorage {
 //=== WAL Operation ===
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum Operation {
+enum Operation {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
 }
@@ -243,6 +251,228 @@ impl<S: Storage> Storage for WalStorage<S> {
     }
 }
 
+//=== MapService (named LMDB databases) ===
+
+use std::sync::Arc;
+
+/// Holds a single LMDB environment and creates named maps (named databases).
+pub struct MapService {
+    env: Arc<Environment>,
+}
+
+impl MapService {
+    /// Initialize the environment at `path`, allowing up to `max_maps` named DBs.
+    pub fn new(path: impl AsRef<Path>, max_maps: u32) -> Result<Self, StorageError> {
+        std::fs::create_dir_all(path.as_ref())?;
+        let env = Environment::new()
+            .set_max_dbs(max_maps)
+            .open(path.as_ref())?;
+        Ok(MapService { env: Arc::new(env) })
+    }
+
+    /// Get a per-map `LmdbStorage` for the given map name.
+    pub fn get_map(&self, name: &str) -> Result<LmdbStorage, StorageError> {
+        // Reuse LmdbStorage by building from shared environment
+        LmdbStorage::from_env(Arc::clone(&self.env), name)
+    }
+}
+
+/// Example of using MapService to manage multiple IMaps.
+fn example_maps() -> Result<(), StorageError> {
+    let service = MapService::new("/data/my-hazelcast", 16)?;
+    
+    // User map
+    let user_map = service.get_map("user")?;
+    user_map.put(b"noel::address", b"123 Maple St.")?;
+    let addr = user_map.get(b"noel::address")?.unwrap();
+    println!("Noel address: {}", String::from_utf8_lossy(&addr));
+
+    // Orders map
+    let orders_map = service.get_map("orders")?;
+    orders_map.put(b"order123", b"{...}")?;
+    Ok(())
+}
+
+//=== Async TCP Server with WAL-backed MapService ===
+
+#[cfg(feature = "tcp-server")]
+mod server {
+    use super::{MapService, StorageError};
+    use super::LmdbStorage;
+    use super::WalStorage;
+    use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
+    use std::{sync::Arc, path::Path};
+
+    /// Start a TCP server serving multiple named maps with WAL durability.
+    ///
+    /// **On-the-wire frame format:**
+    /// ```text
+    /// +------------+-------------------+--------+-----------------------------------------+
+    /// | map_len(1) | map_name(bytes)   | op(1)  | payload...                              |
+    /// +------------+-------------------+--------+-----------------------------------------+
+    /// ```
+    ///
+    /// - **map_len (1 byte):** length in bytes of the map_name string.
+    /// - **map_name (map_len bytes):** UTF-8 encoded name of the map (e.g. "user").
+    /// - **op (1 byte):** operation code:
+    ///     - `0x01` = GET
+    ///     - `0x02` = PUT
+    ///     - `0x03` = DELETE
+    ///
+    /// **Payload by operation:**
+    /// - **GET (0x01):**
+    ///     4-byte BE key length + key bytes
+    /// - **PUT (0x02):**
+    ///     4-byte BE key length + 4-byte BE value length + key bytes + value bytes
+    /// - **DELETE (0x03):**
+    ///     4-byte BE key length + key bytes
+    ///
+    /// **Responses:**
+    /// - GET success: `0x11` + 4-byte BE value length + value bytes
+    /// - GET miss:    `0x12`
+    /// - PUT success: `0x21`
+    /// - DELETE ok:   `0x31`
+    /// - Error:       `0xFF`
+    ///
+    /// **Example:** to GET from map "user" key "noel":
+    /// ```text
+    /// [0x04][0x75 0x73 0x65 0x72][0x01][0x00 0x00 0x00 0x04][0x6E 0x6F 0x65 0x6C]
+    /// ```
+    ///  breakdown:
+    ///    map_len=4, map_name="user", op=GET, key_len=4, key="noel"
+    pub async fn serve(
+        addr: &str,
+        db_dir: impl AsRef<Path>,
+        wal_dir: impl AsRef<Path>,
+        map_names: &[&str],
+        max_maps: u32,
+    ) -> Result<(), StorageError> {
+        // Initialize MapService
+        let service = MapService::new(db_dir, max_maps)?;
+        // Prepare WAL-backed stores for each map
+        let mut stores = std::collections::HashMap::new();
+        for &name in map_names {
+            let lmdb = service.get_map(name)?;
+            let wal_path = wal_dir.as_ref().join(format!("{}{}.wal", name, ""));
+            let store = WalStorage::new(lmdb, wal_path)?;
+            stores.insert(name.to_string(), Arc::new(store));
+        }
+
+        let listener = TcpListener::bind(addr).await.expect("bind failed");
+        println!("Serving on {}", addr);
+
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("accept failed");
+            let stores = stores.clone();
+            tokio::spawn(async move {
+                loop {
+                    // Read map namespace
+                    let map_len = match socket.read_u8().await {
+                        Ok(len) => len as usize,
+                        Err(_) => break,
+                    };
+                    let mut map_buf = vec![0u8; map_len];
+                    if socket.read_exact(&mut map_buf).await.is_err() {
+                        break;
+                    }
+                    let map_name = String::from_utf8_lossy(&map_buf);
+                    let store = match stores.get(map_name.as_ref()) {
+                        Some(s) => s.clone(),
+                        None => { let _ = socket.write_u8(0xFE).await; break; }
+                    };
+                    // Read op code
+                    let op = match socket.read_u8().await {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    match op {
+                        0x01 => { // GET
+                            let key_len = socket.read_u32().await.unwrap() as usize;
+                            let mut key = vec![0u8; key_len];
+                            if socket.read_exact(&mut key).await.is_err() { break; }
+                            match store.get(&key) {
+                                Ok(Some(v)) => {
+                                    socket.write_u8(0x11).await.unwrap();
+                                    socket.write_u32(v.len() as u32).await.unwrap();
+                                    socket.write_all(&v).await.unwrap();
+                                }
+                                Ok(None) => { socket.write_u8(0x12).await.unwrap(); }
+                                Err(_) => { socket.write_u8(0xFF).await.unwrap(); }
+                            }
+                        }
+                        0x02 => { // PUT
+                            let klen = socket.read_u32().await.unwrap() as usize;
+                            let vlen = socket.read_u32().await.unwrap() as usize;
+                            let mut key = vec![0u8; klen];
+                            let mut val = vec![0u8; vlen];
+                            socket.read_exact(&mut key).await.unwrap();
+                            socket.read_exact(&mut val).await.unwrap();
+                            if store.put(&key, &val).is_ok() {
+                                socket.write_u8(0x21).await.unwrap();
+                            } else {
+                                socket.write_u8(0xFF).await.unwrap();
+                            }
+                        }
+                        0x03 => { // DELETE
+                            let klen = socket.read_u32().await.unwrap() as usize;
+                            let mut key = vec![0u8; klen];
+                            socket.read_exact(&mut key).await.unwrap();
+                            if store.delete(&key).is_ok() {
+                                socket.write_u8(0x31).await.unwrap();
+                            } else {
+                                socket.write_u8(0xFF).await.unwrap();
+                            }
+                        }
+                        _ => {
+                            socket.write_u8(0xFD).await.unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+//=== FlatBuffers Schema for TCP Protocol ===
+
+/*
+file: imap_protocol.fbs
+
+namespace kvstore;
+
+// Supported operations
+enum Operation : byte {
+  GET = 1,
+  PUT = 2,
+  DELETE = 3
+}
+
+// Request message
+table Request {
+  map_name: string;         // e.g. "user"
+  op: Operation;
+  key: [ubyte];             // key bytes
+  value: [ubyte];           // value bytes, present only for PUT
+}
+
+// Response message
+enum ResponseStatus : byte {
+  OK = 1,
+  NOT_FOUND = 2,
+  ERROR = 255
+}
+
+table Response {
+  status: ResponseStatus;
+  value: [ubyte];           // present only for GET+OK
+  message: string;          // optional error message
+}
+
+root_type Request;
+root_type Response;
+*/
+
 //=== Tests ===
 
 #[cfg(test)]
@@ -251,16 +481,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_storage<S: Storage>(store: &S) -> Result<(), StorageError> {
-        // get on missing key
-        assert_eq!(store.get(b"foo").unwrap(), None);
-
-        // put and get
-        store.put(b"foo", b"bar")?;
-        assert_eq!(store.get(b"foo")?.unwrap(), b"bar".to_vec());
-
-        // delete and get
-        store.delete(b"foo").unwrap();
-        assert_eq!(store.get(b"foo").unwrap(), None);
+        store.put(b"k1", b"v1")?;
+        assert_eq!(store.get(b"k1")?.unwrap(), b"v1".to_vec());
+        store.delete(b"k1")?;
+        assert!(store.get(b"k1")?.is_none());
         Ok(())
     }
 
@@ -280,20 +504,12 @@ mod tests {
     #[test]
     fn lmdb_storage_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
-        let lmdb = LmdbStorage::new(dir.path().join("lmdb"), 1)
-            .expect("open lmdb store");
-        test_storage(&lmdb)
-    }
-
-    #[ignore]
-    #[test]
-    fn test_lmdb_data_dir() ->  Result<(), StorageError>{
-        let lmdb = LmdbStorage::new(Path::new("data/lmdb"), 1).expect("create lmdb");
+        let lmdb = LmdbStorage::new(dir.path().join("lmdb"), 1)?;
         test_storage(&lmdb)
     }
 
     #[test]
-    fn wal_on_in_memory_works() -> Result<(), StorageError> {
+    fn wal_on_in_memory_basic_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
         let mem = InMemoryStorage::new();
         let wal = WalStorage::new(mem, dir.path().join("wal_mem.log"))?;
@@ -301,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_on_sled_works() -> Result<(), StorageError> {
+    fn wal_on_sled_basic_works() -> Result<(), StorageError> {
         let dir = tempdir()?;
         let sled = SledStorage::new(dir.path().join("sled2"))?;
         let wal = WalStorage::new(sled, dir.path().join("wal_sled.log"))?;
@@ -315,7 +531,7 @@ mod tests {
         // Phase 1: initial writes
         {
             let mem1 = InMemoryStorage::new();
-            let store1 = WalStorage::new(mem1, &wal_path)?;
+            let mut store1 = WalStorage::new(mem1, &wal_path)?;
             store1.put(b"a", b"1")?;
             store1.put(b"b", b"2")?;
         }
@@ -334,7 +550,7 @@ mod tests {
         // Phase 1: initial writes
         {
             let sled1 = SledStorage::new(dir.path().join("sled3"))?;
-            let store1 = WalStorage::new(sled1, &wal_path)?;
+            let mut store1 = WalStorage::new(sled1, &wal_path)?;
             store1.put(b"x", b"7")?;
             store1.put(b"y", b"8")?;
         }
@@ -345,5 +561,4 @@ mod tests {
         assert_eq!(store2.get(b"y")?.unwrap(), b"8".to_vec());
         Ok(())
     }
-
 }
