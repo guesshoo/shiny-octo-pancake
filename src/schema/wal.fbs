@@ -1,0 +1,42 @@
+namespace cache;
+
+// WAL record wrapper for Raft-like replication
+// file_identifier provides a 4-byte magic for validation
+file_identifier "WALR";
+
+// Commands that can be logged
+table SetCommand {
+  key: [ubyte] (required);
+  value: [ubyte] (required);
+}
+table DeleteCommand {
+  key: [ubyte] (required);
+}
+// Optional snapshot install command
+// Includes checksum for data integrity verification
+// checksum: CRC-64 over serialized snapshot blob
+
+/// SnapshotCommand captures a point-in-time snapshot of the state machine.
+table SnapshotCommand {
+  snapshot_term: ulong;      // term at which snapshot taken
+  snapshot_index: ulong;     // index up to which snapshot includes
+  checksum: ulong;           // CRC-64 checksum of the snapshot data
+  data: [ubyte];             // serialized snapshot blob
+}
+
+// Union of possible operations
+union Command {
+  SetCommand,
+  DeleteCommand,
+  SnapshotCommand
+}
+
+// WAL record: term, index, and an application command
+table WalRecord {
+  term: ulong;               // current term for leader-based protocol
+  index: ulong;              // log index (monotonic)
+  op: Command;               // the logged operation
+}
+
+// Entry point for FlatBuffers parsing
+root_type WalRecord;

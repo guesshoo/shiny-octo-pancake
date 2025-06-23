@@ -13,7 +13,7 @@ fn main() {
 // Run FlatBuffers compiler. (TODO: )
 fn compile_fbs() {
     Command::new("flatc")
-        .args(&["--rust", "-o", "src/", "schema/monster.fbs"])
+        .args(&["--rust", "-o", "src/schema", "src/schema/wal.fbs"])
         .status()
         .expect("Failed to run flatc");
 }

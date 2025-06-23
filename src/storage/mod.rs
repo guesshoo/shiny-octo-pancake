@@ -1,14 +1,15 @@
 //! Simple KV store abstraction, multiple backends (LMDB, In-Memory, Sled) with WAL support
 
-use lmdb::{Environment, Database, Transaction, WriteFlags, RoTransaction};
+pub mod lmdb_store;
+pub mod mapservice;
+pub mod wal;
+
 use sled::Db as SledDb;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use std::path::Path;
-use std::sync::RwLock;
 use std::fs::{OpenOptions, File};
 use std::io::{self, Read, Seek, SeekFrom, Write, IoSlice};
-use std::collections::HashMap;
 use std::cell::RefCell;
 
 /// Errors that can occur in storage operations.
@@ -24,114 +25,38 @@ pub enum StorageError {
     Serde(#[from] bincode::Error),
 }
 
-/// Generic storage trait, simple owned buffer API.
+/// Generic storage trait with basic K/V operations.
 pub trait Storage {
-    /// Get a value by key. Returns Ok(None) if key not found.
+    /// Retrieve the value for a given key.
+    ///
+    /// Returns `Ok(Some(vec))` if the key exists,
+    /// `Ok(None)` if it does not, or an error.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError>;
-    /// Put a key-value pair into storage.
+
+    /// Insert or overwrite a key with the given value.
+    ///
+    /// Returns `Ok(())` on success, or an error.
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError>;
-    /// Delete a key (no-op if missing).
+
+    /// Remove a key from storage.
+    ///
+    /// Returns `Ok(())` on success (no-op if key missing), or an error.
     fn delete(&self, key: &[u8]) -> Result<(), StorageError>;
-}
 
-//=== LMDB Backend ===
-
-/// LMDB-backed implementation of `Storage`.
-/// LMDB-backed implementation of `Storage`.
-pub struct LmdbStorage {
-    /// Shared LMDB environment
-    pub env: Arc<Environment>,
-    /// Named database handle
-    pub db: Database,
-}
-
-impl LmdbStorage {
-    /// Open or create an LMDB environment at the given path.
-    pub fn new(path: impl AsRef<Path>, max_dbs: u32) -> Result<Self, StorageError> {
-        // ensure directory
-        std::fs::create_dir_all(path.as_ref())?;
-        let env = Environment::new()
-            .set_max_dbs(max_dbs)
-            .open(path.as_ref())?;
-        let env = Arc::new(env);
-        let db = env.create_db(Some("kv_store"), lmdb::DatabaseFlags::empty())?;
-        Ok(LmdbStorage { env, db })
-    }
-
-    /// Create a storage from an existing shared environment and named database
-    pub fn from_env(env: Arc<Environment>, name: &str) -> Result<Self, StorageError> {
-        let db = env.create_db(Some(name), lmdb::DatabaseFlags::empty())?;
-        Ok(LmdbStorage { env, db })
-    }
-
-    /// Change active named database in this environment (reuse struct)
-    pub fn use_db(&self, name: &str) -> Result<Self, StorageError> {
-        let db = Arc::clone(&self.env).create_db(Some(name), lmdb::DatabaseFlags::empty())?;
-        Ok(LmdbStorage { env: Arc::clone(&self.env), db })
-    }  
-}
-
-impl Storage for LmdbStorage {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.db, &key) {
-            Ok(slice) => Ok(Some(slice.to_vec())),
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(StorageError::Lmdb(e)),
+    /// Insert the value only if the key is not already present.
+    ///
+    /// Returns `Ok(true)` if inserted, `Ok(false)` if key existed,
+    /// or an error.
+    fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<bool, StorageError> {
+        if self.get(key)?.is_none() {
+            self.put(key, value)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
-
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
-        let mut wtxn = self.env.begin_rw_txn()?;
-        wtxn.put(self.db, &key, &value, WriteFlags::empty())?;
-        wtxn.commit()?;
-        Ok(())
-    }
-
-    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
-        let mut wtxn = self.env.begin_rw_txn()?;
-        // Attempt delete; ignore NotFound, but propagate other errors
-        match wtxn.del(self.db, &key, None) {
-            Ok(_) => (),
-            Err(lmdb::Error::NotFound) => (),
-            Err(e) => return Err(StorageError::Lmdb(e)),
-        };
-        wtxn.commit()?;
-        Ok(())
-    }
 }
 
-//=== In-Memory Backend ===
-
-/// In-memory HashMap implementation. Not durable.
-pub struct InMemoryStorage {
-    map: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
-}
-
-impl InMemoryStorage {
-    pub fn new() -> Self {
-        InMemoryStorage { map: RwLock::new(HashMap::new()) }
-    }
-}
-
-impl Storage for InMemoryStorage {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        let guard = self.map.read().unwrap();
-        Ok(guard.get(key).cloned())
-    }
-
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
-        let mut guard = self.map.write().unwrap();
-        guard.insert(key.to_vec(), value.to_vec());
-        Ok(())
-    }
-
-    fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
-        let mut guard = self.map.write().unwrap();
-        guard.remove(key);
-        Ok(())
-    }
-}
 
 //=== Sled Backend ===
 
@@ -251,47 +176,8 @@ impl<S: Storage> Storage for WalStorage<S> {
     }
 }
 
-//=== MapService (named LMDB databases) ===
 
-use std::sync::Arc;
 
-/// Holds a single LMDB environment and creates named maps (named databases).
-pub struct MapService {
-    env: Arc<Environment>,
-}
-
-impl MapService {
-    /// Initialize the environment at `path`, allowing up to `max_maps` named DBs.
-    pub fn new(path: impl AsRef<Path>, max_maps: u32) -> Result<Self, StorageError> {
-        std::fs::create_dir_all(path.as_ref())?;
-        let env = Environment::new()
-            .set_max_dbs(max_maps)
-            .open(path.as_ref())?;
-        Ok(MapService { env: Arc::new(env) })
-    }
-
-    /// Get a per-map `LmdbStorage` for the given map name.
-    pub fn get_map(&self, name: &str) -> Result<LmdbStorage, StorageError> {
-        // Reuse LmdbStorage by building from shared environment
-        LmdbStorage::from_env(Arc::clone(&self.env), name)
-    }
-}
-
-/// Example of using MapService to manage multiple IMaps.
-fn example_maps() -> Result<(), StorageError> {
-    let service = MapService::new("/data/my-hazelcast", 16)?;
-    
-    // User map
-    let user_map = service.get_map("user")?;
-    user_map.put(b"noel::address", b"123 Maple St.")?;
-    let addr = user_map.get(b"noel::address")?.unwrap();
-    println!("Noel address: {}", String::from_utf8_lossy(&addr));
-
-    // Orders map
-    let orders_map = service.get_map("orders")?;
-    orders_map.put(b"order123", b"{...}")?;
-    Ok(())
-}
 
 //=== Async TCP Server with WAL-backed MapService ===
 
@@ -354,7 +240,7 @@ mod server {
         for &name in map_names {
             let lmdb = service.get_map(name)?;
             let wal_path = wal_dir.as_ref().join(format!("{}{}.wal", name, ""));
-            let store = WalStorage::new(lmdb, wal_path)?;
+            let store = WalStorage::new(lmdb_store, wal_path)?;
             stores.insert(name.to_string(), Arc::new(store));
         }
 
